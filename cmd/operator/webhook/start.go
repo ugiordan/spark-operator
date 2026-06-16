@@ -34,10 +34,14 @@ import (
 	"go.uber.org/zap/zapcore"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -183,7 +187,7 @@ func start() {
 	}
 
 	// Create the manager.
-	tlsOptions := newTLSOptions()
+	tlsOptions := newTLSOptions(cfg)
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: operatorscheme.WebhookScheme,
 		Cache:  newCacheOptions(),
@@ -242,7 +246,7 @@ func start() {
 		},
 		func() (bool, error) {
 			if err := certProvider.SyncSecret(context.TODO(), webhookSecretName, webhookSecretNamespace); err != nil {
-				if errors.IsAlreadyExists(err) || errors.IsConflict(err) {
+				if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
 					return false, nil
 				}
 				return false, err
@@ -344,23 +348,152 @@ func setupLog() {
 	)
 }
 
-func newTLSOptions() []func(c *tls.Config) {
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		logger.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
-	}
+// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,resourceNames=cluster,verbs=get
 
-	tlsOpts := []func(*tls.Config){}
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
+func newTLSOptions(cfg *rest.Config) []func(c *tls.Config) {
+	tlsOpts := fetchTLSProfile(cfg)
+
+	// ALPN configuration
+	if enableHTTP2 {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) {
+			c.NextProtos = []string{"h2", "http/1.1"}
+		})
+	} else {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) {
+			c.NextProtos = []string{"h2", "http/1.1"}
+		})
 	}
 	return tlsOpts
+}
+
+func fetchTLSProfile(cfg *rest.Config) []func(*tls.Config) {
+	var tlsOpts []func(*tls.Config)
+	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer bootstrapCancel()
+
+	bootstrapClient, err := client.New(cfg, client.Options{Scheme: operatorscheme.WebhookScheme})
+	if err != nil {
+		logger.Info("Failed to create bootstrap client for TLS profile, using hardened defaults")
+		tlsOpts = append(tlsOpts, func(c *tls.Config) { c.MinVersion = tls.VersionTLS12 })
+		return tlsOpts
+	}
+
+	apiServer := &unstructured.Unstructured{}
+	apiServer.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "config.openshift.io", Version: "v1", Kind: "APIServer",
+	})
+	if err := bootstrapClient.Get(bootstrapCtx, client.ObjectKey{Name: "cluster"}, apiServer); err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			logger.Info("TLS profile not available, using hardened defaults (non-OpenShift cluster)")
+			tlsOpts = append(tlsOpts, func(c *tls.Config) {
+				c.MinVersion = tls.VersionTLS12
+				c.CipherSuites = intermediateCiphers
+			})
+			return tlsOpts
+		}
+		// RBAC errors (403), timeouts, and other transient failures must not be
+		// silently downgraded. Fail closed so the operator restarts and retries.
+		logger.Error(err, "Failed to read APIServer TLS profile (possible RBAC or transient error), failing startup")
+		os.Exit(1)
+	}
+
+	minVersion, ciphers := parseTLSProfile(apiServer)
+	if ciphers != nil && len(ciphers) == 0 {
+		logger.Error(nil, "Custom TLS profile specified ciphers but none are supported by Go, "+
+			"refusing to start with unrestricted ciphers")
+		os.Exit(1)
+	}
+	logger.Info("Applying cluster TLS profile", "minVersion", minVersion, "ciphers", len(ciphers))
+	tlsOpts = append(tlsOpts, func(c *tls.Config) {
+		c.MinVersion = minVersion
+		if len(ciphers) > 0 {
+			c.CipherSuites = ciphers
+		}
+	})
+	return tlsOpts
+}
+
+var openSSLToGoCipher = map[string]uint16{
+	"ECDHE-ECDSA-AES128-GCM-SHA256": tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	"ECDHE-RSA-AES128-GCM-SHA256":   tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	"ECDHE-ECDSA-AES256-GCM-SHA384": tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	"ECDHE-RSA-AES256-GCM-SHA384":   tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	"ECDHE-ECDSA-CHACHA20-POLY1305": tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+	"ECDHE-RSA-CHACHA20-POLY1305":   tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+	"ECDHE-ECDSA-AES128-SHA256":     tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+	"ECDHE-RSA-AES128-SHA256":       tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+	"AES128-GCM-SHA256":             tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	"AES256-GCM-SHA384":             tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	"AES128-SHA256":                 tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+}
+
+var intermediateCiphers = []uint16{
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+}
+
+func parseTLSProfile(apiServer *unstructured.Unstructured) (uint16, []uint16) {
+	profile, found, err := unstructured.NestedMap(apiServer.Object, "spec", "tlsSecurityProfile")
+	if err != nil {
+		logger.Error(err, "Failed to read tlsSecurityProfile from APIServer, using Intermediate defaults")
+		return tls.VersionTLS12, intermediateCiphers
+	}
+	if !found || profile == nil {
+		return tls.VersionTLS12, intermediateCiphers
+	}
+	profileType, _ := profile["type"].(string)
+	switch profileType {
+	case "Intermediate", "":
+		return tls.VersionTLS12, intermediateCiphers
+	case "Custom":
+		custom, _, err := unstructured.NestedMap(profile, "custom")
+		if err != nil {
+			logger.Error(err, "Failed to read custom TLS profile, using Intermediate defaults")
+			return tls.VersionTLS12, intermediateCiphers
+		}
+		if custom == nil {
+			logger.Info("Custom TLS profile type set but no custom block provided, using Intermediate defaults")
+			return tls.VersionTLS12, intermediateCiphers
+		}
+		minVer, _ := custom["minTLSVersion"].(string)
+		minVersion := tlsVersionFromString(minVer)
+		cipherNames, _, err := unstructured.NestedStringSlice(custom, "ciphers")
+		if err != nil {
+			logger.Error(err, "Failed to read ciphers from custom TLS profile, using Intermediate defaults")
+			return tls.VersionTLS12, intermediateCiphers
+		}
+		ciphers := make([]uint16, 0, len(cipherNames))
+		for _, name := range cipherNames {
+			if id, ok := openSSLToGoCipher[name]; ok {
+				ciphers = append(ciphers, id)
+			} else {
+				logger.Info("Cipher from TLS profile not supported by Go, skipping", "cipher", name)
+			}
+		}
+		return minVersion, ciphers
+	case "Modern":
+		return tls.VersionTLS13, nil
+	case "Old":
+		return tls.VersionTLS12, nil
+	default:
+		logger.Info("Unrecognized TLS profile type, using Intermediate defaults", "profileType", profileType)
+		return tls.VersionTLS12, intermediateCiphers
+	}
+}
+
+func tlsVersionFromString(v string) uint16 {
+	switch v {
+	case "VersionTLS12":
+		return tls.VersionTLS12
+	case "VersionTLS13":
+		return tls.VersionTLS13
+	default:
+		return tls.VersionTLS12
+	}
 }
 
 // newCacheOptions creates and returns a cache.Options instance configured with default namespaces and object caching settings.
