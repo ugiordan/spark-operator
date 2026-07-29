@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -136,8 +137,6 @@ var (
 	healthProbeBindAddress                      string
 	pprofBindAddress                            string
 	secureMetrics                               bool
-	tlsMinVersion                               string
-	tlsCipherSuites                             []string
 	scheduledSparkApplicationTimestampPrecision string
 	development                                 bool
 	zapOptions                                  = logzap.Options{}
@@ -249,13 +248,6 @@ func NewStartCommand() *cobra.Command {
 
 	command.Flags().StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	command.Flags().BoolVar(&secureMetrics, "secure-metrics", false, "If set the metrics endpoint is served securely")
-	command.Flags().StringVar(&tlsMinVersion, "metric-tls-min-version", "VersionTLS12",
-		"Minimum TLS version for the metrics server. "+
-			"Possible values: VersionTLS12, VersionTLS13")
-	command.Flags().StringSliceVar(&tlsCipherSuites, "metric-tls-cipher-suites", []string{},
-		"Comma-separated list of cipher suites for the metrics server. "+
-			"If omitted, the default Go cipher suites are used. "+
-			"Applies to TLS 1.2 only; TLS 1.3 cipher suites are not configurable in Go. Possible values listed at https://pkg.go.dev/crypto/tls#CipherSuites")
 
 	command.Flags().StringVar(&pprofBindAddress, "pprof-bind-address", "0", "The address the pprof endpoint binds to. "+
 		"If not set, it will be 0 in order to disable the pprof server")
@@ -297,12 +289,13 @@ func start() {
 	cfg.QPS = kubeAPIQPS
 	cfg.Burst = kubeAPIBurst
 
-	// Create the manager.
-	tlsOptions, err := operatortls.SetupTLS(tlsMinVersion, tlsCipherSuites)
-	if err != nil {
-		logger.Error(err, "Failed to set up TLS")
-		os.Exit(1)
-	}
+	// Fetch cluster TLS security profile (OpenShift) or use hardened defaults.
+	profileResult := operatortls.FetchTLSProfile(cfg, operatorscheme.ControllerScheme)
+	tlsOptions := profileResult.TLSOpts
+	tlsOptions = append(tlsOptions, func(c *tls.Config) {
+		c.NextProtos = []string{"h2", "http/1.1"}
+	})
+
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: operatorscheme.ControllerScheme,
 		Cache:  newCacheOptions(),
@@ -378,7 +371,18 @@ func start() {
 		}
 	}
 
-	ctx := ctrl.SetupSignalHandler()
+	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
+
+	if profileResult.Fetched {
+		watcher := operatortls.NewProfileWatcher(mgr.GetClient(), profileResult.RawSpec, func() {
+			logger.Info("TLS security profile changed, shutting down for restart")
+			cancel()
+		})
+		if err := watcher.SetupWithManager(mgr); err != nil {
+			logger.Error(err, "Failed to set up TLS security profile watcher; profile changes will not trigger a restart")
+		}
+	}
 
 	sparkSubmitter, err := newSparkSubmitter(ctx)
 	if err != nil {
