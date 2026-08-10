@@ -36,7 +36,6 @@ var watcherLog = ctrl.Log.WithName("tls-profile-watcher")
 
 type ProfileWatcher struct {
 	client.Client
-	initialProfile  map[string]interface{}
 	lastProfile     map[string]interface{}
 	onProfileChange func()
 }
@@ -44,7 +43,6 @@ type ProfileWatcher struct {
 func NewProfileWatcher(c client.Client, initialProfile map[string]interface{}, onProfileChange func()) *ProfileWatcher {
 	return &ProfileWatcher{
 		Client:          c,
-		initialProfile:  initialProfile,
 		lastProfile:     initialProfile,
 		onProfileChange: onProfileChange,
 	}
@@ -102,3 +100,22 @@ func (w *ProfileWatcher) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// SetupProfileWatcherRestart wraps the cancel-context + ProfileWatcher setup
+// so that controller and webhook entry points share a single contract.
+// Returns a cancellable context: if the TLS profile changes at runtime, the
+// context is cancelled, causing the manager to shut down for restart.
+func SetupProfileWatcherRestart(ctx context.Context, mgr ctrl.Manager, result FetchResult) context.Context {
+	if !result.APIAvailable {
+		return ctx
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	watcher := NewProfileWatcher(mgr.GetClient(), result.RawSpec, func() {
+		watcherLog.Info("TLS security profile changed, shutting down for restart")
+		cancel()
+	})
+	if err := watcher.SetupWithManager(mgr); err != nil {
+		watcherLog.Error(err, "Failed to set up TLS security profile watcher; profile changes will not trigger a restart")
+	}
+	return ctx
+}

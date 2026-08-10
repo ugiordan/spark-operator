@@ -248,14 +248,17 @@ func TestParseTLSProfile(t *testing.T) {
 }
 
 func TestFetchTLSProfileWithClient(t *testing.T) {
-	t.Run("NotFound returns hardened default with Fetched=false", func(t *testing.T) {
+	t.Run("NoMatch returns hardened default with APIAvailable=false", func(t *testing.T) {
 		c := fake.NewClientBuilder().Build()
 		result := FetchTLSProfileWithClient(context.Background(), c)
 		if result.Fetched {
-			t.Error("expected Fetched=false for NotFound")
+			t.Error("expected Fetched=false for NoMatch")
+		}
+		if result.APIAvailable {
+			t.Error("expected APIAvailable=false for NoMatch (non-OpenShift)")
 		}
 		if result.RawSpec != nil {
-			t.Error("expected nil RawSpec for NotFound")
+			t.Error("expected nil RawSpec for NoMatch")
 		}
 		cfg := &cryptotls.Config{}
 		for _, opt := range result.TLSOpts {
@@ -266,7 +269,23 @@ func TestFetchTLSProfileWithClient(t *testing.T) {
 		}
 	})
 
-	t.Run("successful fetch returns profile with Fetched=true", func(t *testing.T) {
+	t.Run("NotFound returns hardened default with APIAvailable=false", func(t *testing.T) {
+		c := fake.NewClientBuilder().
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+					return apierrors.NewNotFound(schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"}, "cluster")
+				},
+			}).Build()
+		result := FetchTLSProfileWithClient(context.Background(), c)
+		if result.Fetched {
+			t.Error("expected Fetched=false for NotFound")
+		}
+		if result.APIAvailable {
+			t.Error("expected APIAvailable=false for NotFound")
+		}
+	})
+
+	t.Run("successful fetch returns profile with Fetched=true and APIAvailable=true", func(t *testing.T) {
 		apiServer := &unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": "config.openshift.io/v1",
 			"kind":       "APIServer",
@@ -281,6 +300,9 @@ func TestFetchTLSProfileWithClient(t *testing.T) {
 		result := FetchTLSProfileWithClient(context.Background(), c)
 		if !result.Fetched {
 			t.Error("expected Fetched=true for successful fetch")
+		}
+		if !result.APIAvailable {
+			t.Error("expected APIAvailable=true for successful fetch")
 		}
 		cfg := &cryptotls.Config{}
 		for _, opt := range result.TLSOpts {
@@ -313,7 +335,7 @@ func TestFetchTLSProfileWithClient(t *testing.T) {
 		}
 	})
 
-	t.Run("transient error returns Intermediate with Fetched=false", func(t *testing.T) {
+	t.Run("transient error returns Intermediate with Fetched=false but APIAvailable=true", func(t *testing.T) {
 		c := fake.NewClientBuilder().
 			WithInterceptorFuncs(interceptor.Funcs{
 				Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
@@ -322,7 +344,10 @@ func TestFetchTLSProfileWithClient(t *testing.T) {
 			}).Build()
 		result := FetchTLSProfileWithClient(context.Background(), c)
 		if result.Fetched {
-			t.Error("expected Fetched=false for transient error (watcher should not use unconfirmed snapshot as baseline)")
+			t.Error("expected Fetched=false for transient error")
+		}
+		if !result.APIAvailable {
+			t.Error("expected APIAvailable=true for transient error (API exists, just temporarily unavailable)")
 		}
 		cfg := &cryptotls.Config{}
 		for _, opt := range result.TLSOpts {
@@ -336,7 +361,7 @@ func TestFetchTLSProfileWithClient(t *testing.T) {
 		}
 	})
 
-	t.Run("non-transient error returns hardened default with Fetched=false", func(t *testing.T) {
+	t.Run("Forbidden returns Fetched=false but APIAvailable=true", func(t *testing.T) {
 		c := fake.NewClientBuilder().
 			WithInterceptorFuncs(interceptor.Funcs{
 				Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
@@ -345,7 +370,42 @@ func TestFetchTLSProfileWithClient(t *testing.T) {
 			}).Build()
 		result := FetchTLSProfileWithClient(context.Background(), c)
 		if result.Fetched {
+			t.Error("expected Fetched=false for Forbidden")
+		}
+		if !result.APIAvailable {
+			t.Error("expected APIAvailable=true for Forbidden (API exists, RBAC is wrong)")
+		}
+	})
+
+	t.Run("Unauthorized returns Fetched=false but APIAvailable=true", func(t *testing.T) {
+		c := fake.NewClientBuilder().
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+					return apierrors.NewUnauthorized("unauthenticated")
+				},
+			}).Build()
+		result := FetchTLSProfileWithClient(context.Background(), c)
+		if result.Fetched {
+			t.Error("expected Fetched=false for Unauthorized")
+		}
+		if !result.APIAvailable {
+			t.Error("expected APIAvailable=true for Unauthorized (API exists, auth is wrong)")
+		}
+	})
+
+	t.Run("unknown non-transient error returns hardened default with APIAvailable=false", func(t *testing.T) {
+		c := fake.NewClientBuilder().
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+					return apierrors.NewInternalError(fmt.Errorf("something broke"))
+				},
+			}).Build()
+		result := FetchTLSProfileWithClient(context.Background(), c)
+		if result.Fetched {
 			t.Error("expected Fetched=false for non-transient error")
+		}
+		if result.APIAvailable {
+			t.Error("expected APIAvailable=false for unknown non-transient error")
 		}
 	})
 

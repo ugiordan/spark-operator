@@ -36,9 +36,10 @@ import (
 var profileLog = ctrl.Log.WithName("tls-profile")
 
 type FetchResult struct {
-	TLSOpts []func(*cryptotls.Config)
-	Fetched bool
-	RawSpec map[string]interface{}
+	TLSOpts      []func(*cryptotls.Config)
+	Fetched      bool
+	APIAvailable bool
+	RawSpec      map[string]interface{}
 }
 
 var APIServerGVK = schema.GroupVersionKind{
@@ -63,16 +64,30 @@ func FetchTLSProfileWithClient(ctx context.Context, c client.Client) FetchResult
 	apiServer.SetGroupVersionKind(APIServerGVK)
 
 	if err := c.Get(ctx, client.ObjectKey{Name: "cluster"}, apiServer); err != nil {
-		if errors.IsNotFound(err) || meta.IsNoMatchError(err) {
-			profileLog.Info("TLS profile not available, using hardened defaults (non-OpenShift cluster)")
+		if meta.IsNoMatchError(err) {
+			profileLog.Info("TLS profile not available (non-OpenShift cluster)")
+			return hardenedDefault()
+		}
+		if errors.IsNotFound(err) {
+			profileLog.Info("APIServer resource not found, using hardened defaults")
 			return hardenedDefault()
 		}
 		if isTransient(err) {
 			profileLog.Info("Transient error reading APIServer TLS profile, using Intermediate fallback", "error", err)
 			return FetchResult{
-				TLSOpts: intermediateOpts(),
-				Fetched: false,
-				RawSpec: nil,
+				TLSOpts:      intermediateOpts(),
+				Fetched:      false,
+				APIAvailable: true,
+				RawSpec:      nil,
+			}
+		}
+		if errors.IsForbidden(err) || errors.IsUnauthorized(err) {
+			profileLog.Error(err, "Permission denied reading TLS profile, using hardened defaults; watcher will retry")
+			return FetchResult{
+				TLSOpts:      intermediateOpts(),
+				Fetched:      false,
+				APIAvailable: true,
+				RawSpec:      nil,
 			}
 		}
 		profileLog.Error(err, "Failed to read APIServer TLS profile, using hardened defaults")
@@ -91,8 +106,9 @@ func FetchTLSProfileWithClient(ctx context.Context, c client.Client) FetchResult
 				}
 			},
 		},
-		Fetched: true,
-		RawSpec: rawSpec,
+		Fetched:      true,
+		APIAvailable: true,
+		RawSpec:      rawSpec,
 	}
 }
 

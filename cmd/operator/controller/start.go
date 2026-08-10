@@ -371,18 +371,7 @@ func start() {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
-	defer cancel()
-
-	if profileResult.Fetched {
-		watcher := operatortls.NewProfileWatcher(mgr.GetClient(), profileResult.RawSpec, func() {
-			logger.Info("TLS security profile changed, shutting down for restart")
-			cancel()
-		})
-		if err := watcher.SetupWithManager(mgr); err != nil {
-			logger.Error(err, "Failed to set up TLS security profile watcher; profile changes will not trigger a restart")
-		}
-	}
+	ctx := operatortls.SetupProfileWatcherRestart(ctrl.SetupSignalHandler(), mgr, profileResult)
 
 	sparkSubmitter, err := newSparkSubmitter(ctx)
 	if err != nil {
