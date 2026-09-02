@@ -18,6 +18,8 @@ package tls
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -246,4 +248,45 @@ func TestProfileWatcher_UpdatesLastProfile(t *testing.T) {
 	if profileType != "Modern" {
 		t.Errorf("expected lastProfile type=Modern, got %q", profileType)
 	}
+}
+
+func TestSetupProfileWatcherRestart(t *testing.T) {
+	t.Run("skips registration when the OpenShift API is unavailable", func(t *testing.T) {
+		ctx := t.Context()
+		got, err := SetupProfileWatcherRestart(ctx, nil, FetchResult{APIAvailable: false})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != ctx {
+			t.Error("expected the original context when the API is unavailable")
+		}
+		select {
+		case <-got.Done():
+			t.Error("original context should not be cancelled")
+		default:
+		}
+	})
+
+	t.Run("fails closed when watcher setup fails", func(t *testing.T) {
+		result := FetchResult{
+			APIAvailable: true,
+			RawSpec:      map[string]interface{}{"type": "Intermediate"},
+		}
+
+		got, err := setupProfileWatcherRestart(t.Context(), nil, result, func(*ProfileWatcher) error {
+			return errors.New("setup failed")
+		})
+
+		if err == nil {
+			t.Fatal("expected error when watcher registration fails")
+		}
+		if !strings.Contains(err.Error(), "unable to set up TLS security profile watcher") {
+			t.Errorf("unexpected error: %v", err)
+		}
+		select {
+		case <-got.Done():
+		default:
+			t.Error("derived context should be cancelled when setup fails")
+		}
+	})
 }

@@ -232,6 +232,12 @@ func start() {
 		os.Exit(1)
 	}
 
+	ctx, err := operatortls.SetupProfileWatcherRestart(ctrl.SetupSignalHandler(), mgr, profileResult)
+	if err != nil {
+		logger.Error(err, "Failed to set up TLS security profile watcher")
+		os.Exit(1)
+	}
+
 	client, err := client.New(cfg, client.Options{Scheme: mgr.GetScheme()})
 	if err != nil {
 		logger.Error(err, "Failed to create client")
@@ -338,8 +344,6 @@ func start() {
 		logger.Error(err, "Failed to set up ready check")
 		os.Exit(1)
 	}
-
-	ctx := operatortls.SetupProfileWatcherRestart(ctrl.SetupSignalHandler(), mgr, profileResult)
 
 	logger.Info("Starting manager")
 	if err := mgr.Start(ctx); err != nil {

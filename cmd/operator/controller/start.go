@@ -371,7 +371,11 @@ func start() {
 		}
 	}
 
-	ctx := operatortls.SetupProfileWatcherRestart(ctrl.SetupSignalHandler(), mgr, profileResult)
+	ctx, err := operatortls.SetupProfileWatcherRestart(ctrl.SetupSignalHandler(), mgr, profileResult)
+	if err != nil {
+		logger.Error(err, "Failed to set up TLS security profile watcher")
+		os.Exit(1)
+	}
 
 	sparkSubmitter, err := newSparkSubmitter(ctx, tlsOptions)
 	if err != nil {
